@@ -1,0 +1,1716 @@
+---
+title: "iNaturalist New England Flowering Phenology and Abundance Analysis"
+author: "Jacob M. Musser"
+date: "`r doc_date()`"
+output: 
+    BiocStyle::html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        code_folding: show
+    BiocStyle::pdf_document:
+        toc: true
+        highlight: tango
+---
+
+# Overview
+
+This analysis examines flowering phenology and abundance patterns for Connecticut tracheophytes using iNaturalist observations from across New England (last 10 years). The script generates multiple comprehensive multi-page PDFs describing phenology and abundance of New England and Connecticut species.
+
+**Output PDFs:**
+
+1. **phenology_CT_tracheophytes_complete.pdf** - Multi-page faceted barplots showing weekly flowering patterns for all species, organized by family and genus (one genus per page)
+2. **ct_native_flowering_ridgeplots.pdf** - Ridge plots of CT native species flowering phenology, organized by peak flowering time (25 species per page)
+3. **family_overview_table.pdf** - Summary table of species counts per family across abundance categories
+4. **rare_ct_native_species_flowering.pdf** - Detailed table of Connecticut rare native species with flowering phenology metrics
+
+**Key features:**
+
+*Phenology visualization:*
+- **Sparse data handling**: Species with <5 flowering observations shown as points, 5-14 as light bars, ≥15 as solid bars
+- **Week-based temporal resolution**: Uses 52-week calendar to avoid ISO week complications at year boundaries
+- **Peak flowering metrics**: Weighted mean calculation provides robust phenological center for each species
+- **Flowering duration**: 10th-90th percentile windows capture central flowering period
+- **Raw count approach**: Shows actual observation counts rather than normalized proportions
+- **Y-axis minimum**: Set to 10 to make rare species more visually distinct
+
+*Abundance categories:*
+- Connecticut common: >50 observations in CT
+- Connecticut uncommon: 11-50 observations in CT
+- Connecticut rare: 1-10 observations in CT
+- New England (no CT obs): >10 observations in NE, 0 in CT
+- New England rare (no CT obs): 1-10 observations in NE, 0 in CT
+
+*Visualization details:*
+- **Non-flowering taxa**: Abundance line colored by category (since no flowering bars/points)
+- **Native status**: Species native to Connecticut marked with asterisk (*) in labels
+- **Ridge plots**: Color gradient by week using viridis palette (consistent across all pages)
+- **Common names**: Included in ridge plot labels where available
+
+**Data sources:**
+
+- GBIF download of iNaturalist observations (New England angiosperms/tracheophytes, 2015-2024) including phenology annotations
+- Common names retrieved via iNaturalist API.
+- Species-level aggregation (varieties/subspecies collapsed to species)
+- Native status from Connecticut Botanical Society checklist (BONAP-based)
+
+```{r setup, include = FALSE}
+library(knitr)
+options(digits = 3, width = 80)
+opts_chunk$set(echo = TRUE, tidy = FALSE, include = TRUE,
+               dev = 'png', comment = '  ',
+               dpi = 300, cache.lazy = FALSE, warning = FALSE)
+```
+
+# Step 0: Setup and Configuration
+```{r load_packages}
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(cowplot)
+library(kableExtra)
+library(httr)
+library(jsonlite)
+library(gridExtra)
+library(grid)
+library(ggridges)
+
+
+if (!requireNamespace("ggforce", quietly = TRUE)) {
+  install.packages("ggforce")
+}
+library(ggforce)
+
+# Path to the unzipped GBIF DwC-A download
+unzipped <- "dwca_ne_angiosperms"  # <-- CHANGE THIS PATH
+
+# New England states
+new_england_states <- c(
+  "Connecticut",
+  "Maine",
+  "Massachusetts",
+  "New Hampshire",
+  "Rhode Island",
+  "Vermont"
+)
+
+# Minimum total wild observations in New England (last 10 years)
+min_total_obs <- 1L
+
+# Thresholds for abundance categories (last 10 years)
+# For CT species:
+min_ct_obs_rare <- 10L        # 1-10 obs → CT rare
+min_ct_obs_uncommon <- 50L    # 11-50 obs → CT uncommon
+                              # >50 obs → CT common
+# For NE-only species (no CT obs):
+min_ne_obs_rare <- 10L        # 1-10 obs → NE rare
+                              # >10 obs → NE (not rare)
+
+# Sparse data thresholds for visualization
+sparse_threshold_points_only <- 5L     # <5 flowering obs: points only
+sparse_threshold_light <- 15L          # 5-15 flowering obs: points + light bars
+# >15 flowering obs: full bars
+
+```
+
+# Step 1: Helper Functions
+```{r helper_functions}
+
+
+# Map week-of-year to month for x-axis labels and boundaries
+week_month_lookup <- function(n_weeks = 52) {
+  # Simple approach: divide year into equal weeks
+  # Week 1 = days 1-7, Week 2 = days 8-14, etc.
+  weeks <- 1:n_weeks
+  
+  # Use a non-leap year for consistency
+  tibble::tibble(
+    week = weeks,
+    # Approximate day of year for middle of each week
+    yday_mid = (weeks - 0.5) * (365 / n_weeks)
+  ) |>
+    mutate(
+      # Convert to date to get month
+      date = as.Date("2023-01-01") + floor(yday_mid),
+      month = month(date),
+      month_label = factor(month.abb[month], levels = month.abb)
+    )
+}
+
+# Add sparse data category based on total flowering observations
+add_sparse_category <- function(df, 
+                                threshold_points = 5L, 
+                                threshold_light = 15L) {
+  df |>
+    group_by(family, genus, species_name, species_common, ct_category, period_label) |>
+    mutate(
+      total_flowering_obs = sum(n_flowering, na.rm = TRUE),
+      sparse_category = case_when(
+        total_flowering_obs < threshold_points ~ "points_only",
+        total_flowering_obs < threshold_light ~ "light_bars",
+        TRUE ~ "full_bars"
+      ),
+      sparse_category = factor(
+        sparse_category, 
+        levels = c("full_bars", "light_bars", "points_only")
+      )
+    ) |>
+    ungroup()
+}
+
+
+peak_week_to_descriptor <- function(peak_week) {
+  # Handle missing values
+  if (is.na(peak_week)) return(NA_character_)
+  
+  # Convert week-of-year to approximate date (your reference year can be any non-leap year)
+  date <- as.Date("2023-01-01") + weeks(peak_week - 1)
+  
+  # Extract parts
+  month_name <- month(date, label = TRUE, abbr = FALSE) |> as.character()
+  day_num    <- day(date)
+  
+  # Early / mid / late designations
+  part <-
+    dplyr::case_when(
+      day_num <= 10            ~ "early",
+      day_num <= 20            ~ "mid",
+      TRUE                     ~ "late"
+    )
+  
+  paste(part, month_name)
+}
+
+```
+
+# Step 1B: Read CT Native data
+```{r read_ct_native_data, results = 'hide'}
+
+# Load and parse CT Botanical Society native status
+ct_native_raw <- readr::read_csv("CT Flora Checklist 8-1-14.csv",
+                                 guess_max = 5000,
+                                 show_col_types = FALSE)
+
+# Standardize column names (remove spaces, lowercase)
+names(ct_native_raw) <- names(ct_native_raw) |>
+  str_replace_all("[^A-Za-z0-9]+", "_") |>
+  tolower()
+
+# Identify the column that holds the scientific name
+# It is usually "scientific_name" or "current_scientific_name"
+sci_col <- names(ct_native_raw)[str_detect(names(ct_native_raw), "scientific")][1]
+
+if (is.na(sci_col)) {
+  stop("Cannot find a scientific name column in the CT native CSV.")
+}
+
+# Clean scientific names
+ct_native_clean <- ct_native_raw |>
+
+  # Keep only the 2 columns we need: scientific name and origin
+  select(scientific_raw = all_of(sci_col), origin) |>
+
+  # Remove parenthetical common names, authorships, anything in parentheses
+  mutate(scientific_raw = str_remove_all(scientific_raw, "\\([^()]*\\)")) |>
+
+  # Remove authorships & abbreviations after species epithet
+  mutate(scientific_raw = str_squish(scientific_raw)) |>
+
+  # Split into genus, species, remainder
+  separate(
+    scientific_raw,
+    into = c("genus", "species", "rest"),
+    sep = " ",
+    extra = "merge",
+    fill = "right",
+    remove = FALSE
+  ) |>
+
+  # Construct normalized GBIF-style species_name
+  mutate(
+    species_name = paste(genus, species),
+    species_name = str_squish(species_name)
+  ) |>
+
+  # Assign native flag
+  mutate(
+    ct_native = case_when(
+      origin == "N" ~ TRUE,
+      TRUE          ~ FALSE
+    )
+  ) |>
+
+  # Keep unique species
+  distinct(species_name, ct_native)
+
+```
+
+# Step 2: Read Ocurrence Data
+```{r read_occurence_data}
+
+occ <- readr::read_tsv(
+  file.path(unzipped, "occurrence.txt"),
+  show_col_types = FALSE
+)
+
+# Keep only New England states and drop genus-level IDs
+occ_ne <- occ |>
+  filter(
+    stateProvince %in% new_england_states,
+    !is.na(taxonRank),
+    taxonRank != "GENUS"
+  )
+
+```
+
+# Step 3: Process Observations
+```{r process_observations}
+
+obs <- occ_ne |>
+  mutate(
+    # Parse date from eventDate
+    date_raw = eventDate,
+    date = as.Date(str_sub(date_raw, 1, 10)),
+    year = year(date),
+    yday = yday(date),
+    
+    # Simple week-of-year: 52 weeks, avoid ISO week complications
+    # Week 1 = days 1-7, Week 2 = days 8-14, etc.
+    week = pmin(ceiling(yday / 7), 52),  # cap at 52 to avoid week 53
+    
+    state_name = stateProvince,
+    
+    # Collapse to species-level (Genus + specific epithet)
+    species_name = if_else(
+      str_detect(scientificName, "^\\S+\\s+\\S+"),
+      str_extract(scientificName, "^\\S+\\s+\\S+"),
+      scientificName
+    ),
+    
+    # Parse reproductive condition tokens
+    cond_tokens = map(
+      reproductiveCondition,
+      ~ {
+        if (is.na(.x) || .x == "") {
+          character(0)
+        } else {
+          str_split(.x, "\\s*\\|\\s*")[[1]] |> str_to_lower()
+        }
+      }
+    ),
+    
+    # FLOWERING definition - be inclusive
+    is_flowering = map_lgl(
+      cond_tokens,
+      ~ any(.x %in% c("flowers", "flowering", "flower buds"))
+    ),
+    
+    # Any non-empty reproductiveCondition counts as annotated
+    is_annotated = !map_lgl(
+      cond_tokens,
+      ~ length(.x) == 0
+    )
+  )
+
+# Drop records without interpretable dates
+obs <- obs |>
+  filter(!is.na(year), !is.na(week))
+
+```
+
+# Step 4: Restrict to last 10 years
+```{r temporal_filter}
+
+max_year <- max(obs$year, na.rm = TRUE)
+min_year <- max_year - 9L
+
+obs <- obs |>
+  filter(year >= min_year) |>
+  mutate(period_label = factor("last 10 years", levels = "last 10 years"))
+
+```
+
+# Step 5: Species-level summary
+```{r species_summary}
+
+species_summary <- obs |>
+  filter(!is.na(species_name)) |>
+  group_by(family, genus, species_name) |>
+  summarise(
+    species_total_n = n(),
+    ct_n = sum(state_name == "Connecticut", na.rm = TRUE),
+    species_common = {
+      vn <- vernacularName[!is.na(vernacularName) & vernacularName != ""]
+      if (length(vn) == 0) NA_character_
+      else names(sort(table(vn), decreasing = TRUE))[1]
+    },
+    .groups = "drop"
+  ) |>
+  mutate(
+    ct_category = case_when(
+      ct_n > min_ct_obs_uncommon ~ "Connecticut common",           # >50 CT obs
+      ct_n > min_ct_obs_rare ~ "Connecticut uncommon",             # 11-50 CT obs
+      ct_n >= 1L ~ "Connecticut rare",                             # 1-10 CT obs
+      ct_n == 0 & species_total_n > min_ne_obs_rare ~ "New England",  # 0 CT, >10 NE
+      TRUE ~ "New England rare"                                    # 0 CT, 1-10 NE
+    ),
+    ct_category = factor(
+      ct_category,
+      levels = c("Connecticut common", "Connecticut uncommon", "Connecticut rare", 
+                 "New England", "New England rare")
+    )
+  ) |>
+  filter(species_total_n >= min_total_obs)
+
+```
+
+
+# Step 5B: Retrieve iNat Common Names
+```{r get_inat_common_names}
+
+# File to store common names lookup
+common_names_file <- "inat_common_names_cache.csv"
+
+# Load existing cache if it exists
+if (file.exists(common_names_file)) {
+  cat("Loading cached common names from", common_names_file, "\n")
+  cached_names <- read_csv(common_names_file, show_col_types = FALSE)
+} else {
+  cached_names <- tibble(species_name = character(), inat_common = character())
+}
+
+# Function to get common name from iNat API
+get_inat_common_name <- function(scientific_name) {
+  Sys.sleep(0.5)  # Be polite to the API
+  
+  url <- "https://api.inaturalist.org/v1/taxa"
+  response <- tryCatch({
+    GET(url, query = list(q = scientific_name, rank = "species"))
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(response) || status_code(response) != 200) {
+    return(NA_character_)
+  }
+  
+  content <- content(response, as = "text", encoding = "UTF-8")
+  parsed <- fromJSON(content, simplifyVector = TRUE)
+  
+  if (length(parsed$results) == 0) {
+    return(NA_character_)
+  }
+  
+  # Get the first exact match
+  exact_match <- parsed$results[parsed$results$name == scientific_name, ]
+  
+  if (nrow(exact_match) == 0) {
+    return(NA_character_)
+  }
+  
+  # Get English common name
+  common <- exact_match$preferred_common_name[1]
+  
+  if (is.null(common) || is.na(common) || common == "") {
+    return(NA_character_)
+  }
+  
+  return(common)
+}
+
+# Find species that need common names AND aren't in cache
+species_needing_names <- species_summary |>
+  filter(is.na(species_common) | species_common == "") |>
+  anti_join(cached_names, by = "species_name")
+
+if (nrow(species_needing_names) > 0) {
+  cat("Fetching common names from iNaturalist for", nrow(species_needing_names), "NEW species...\n")
+  cat("This may take a while (~0.5 sec per species)...\n")
+  cat("Estimated time:", round(nrow(species_needing_names) * 0.5 / 60, 1), "minutes\n\n")
+  
+  # Fetch common names (with progress)
+  inat_common_names <- sapply(seq_len(nrow(species_needing_names)), function(i) {
+    if (i %% 10 == 0) cat("  Progress:", i, "/", nrow(species_needing_names), "\n")
+    get_inat_common_name(species_needing_names$species_name[i])
+  })
+  
+  # Create lookup table for new species
+  new_names <- tibble(
+    species_name = species_needing_names$species_name,
+    inat_common = inat_common_names
+  )
+  
+  # Combine with existing cache
+  cached_names <- bind_rows(cached_names, new_names)
+  
+  # Save updated cache
+  write_csv(cached_names, common_names_file)
+  cat("\nSaved", nrow(cached_names), "species common names to", common_names_file, "\n")
+} else {
+  cat("All species already have common names from cache!\n")
+}
+
+# Update species_summary with cached common names AND native status
+species_summary <- species_summary |>
+  left_join(cached_names, by = "species_name") |>
+  left_join(ct_native_clean, by = "species_name") |>
+  mutate(
+    species_common = if_else(
+      is.na(species_common) | species_common == "",
+      inat_common,
+      species_common
+    )
+  ) |>
+  select(-inat_common)
+
+cat("Total species with common names:", sum(!is.na(species_summary$species_common)), 
+    "out of", nrow(species_summary), "\n")
+cat("Total species with known native status:", sum(!is.na(species_summary$ct_native)), 
+    "out of", nrow(species_summary), "\n")
+```
+
+# Step 6: Join species summary to observations
+```{r join_summary}
+
+obs2 <- obs |>
+  inner_join(
+    species_summary,
+    by = c("family", "genus", "species_name")
+  )
+
+```
+
+# Step 7: Summarize per species x week
+```{r weekly_bins}
+
+by_bin_raw <- obs2 |>
+  group_by(
+    family,
+    genus,
+    species_name,
+    species_common,
+    ct_native,
+    ct_category,
+    period_label,
+    week
+  ) |>
+  summarise(
+    n_total = n(),
+    n_flowering = sum(is_flowering, na.rm = TRUE),
+    n_annotated = sum(is_annotated, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Complete weeks 1-52 per species/period, fill missing weeks with zeros
+by_bin <- by_bin_raw |>
+  group_by(
+    family,
+    genus,
+    species_name,
+    species_common,
+    ct_native,
+    ct_category,
+    period_label
+  ) |>
+  tidyr::complete(
+    week = 1:52,
+    fill = list(
+      n_total = 0L,
+      n_flowering = 0L,
+      n_annotated = 0L
+    )
+  ) |>
+  ungroup() |>
+  # SET FACTOR LEVELS FOR ALL CATEGORIES HERE
+  mutate(
+    ct_category = factor(
+      ct_category,
+      levels = c("Connecticut common", "Connecticut uncommon", "Connecticut rare",
+                 "New England", "New England rare")
+    )
+  )
+
+```
+
+# Step 8: Add spare data categories and strip labels
+```{r add_sparse_info}
+
+by_bin <- by_bin |>
+  add_sparse_category(
+    threshold_points = sparse_threshold_points_only,
+    threshold_light = sparse_threshold_light
+  ) |>
+  mutate(
+    # Strip label: scientific name with asterisk if CT native
+    strip_label = if_else(
+      !is.na(ct_native) & ct_native,
+      paste0(species_name, " *"),
+      species_name
+    )
+  )
+
+```
+
+# Step 9: Week to month mapping for x-axis and month lines
+```{r month_mapping}
+
+week_month_df <- week_month_lookup(n_weeks = 52)
+
+month_breaks <- week_month_df |>
+  group_by(month, month_label) |>
+  summarise(week_mid = floor(mean(week)), .groups = "drop")
+
+month_boundaries <- week_month_df |>
+  group_by(month) |>
+  summarise(week_start = min(week), .groups = "drop") |>
+  mutate(
+    is_major = month %% 3 == 0,  # Mar, Jun, Sep, Dec
+    line_type = if_else(is_major, "solid", "dotted"),
+    line_alpha = if_else(is_major, 0.8, 0.3)
+  )
+
+```
+
+# Step 9B: Diagnostic Checks
+```{r diagnostic_checks}
+
+latest_period <- "last 10 years"
+
+# Check for any issues in the data that might cause plotting errors
+ct_check <- by_bin |>
+  filter(
+    period_label == latest_period,
+    ct_category %in% c("Connecticut common", "Connecticut uncommon", "Connecticut rare",
+                       "New England", "New England rare")
+  )
+
+cat("Diagnostic checks:\n")
+cat("Total rows in ct_species data:", nrow(ct_check), "\n")
+cat("Unique species:", n_distinct(ct_check$species_name), "\n")
+cat("Unique genera:", n_distinct(ct_check$genus), "\n")
+cat("Unique families:", n_distinct(ct_check$family), "\n")
+
+# Check for NA values that could cause issues
+cat("\nChecking for NA values:\n")
+cat("NA in family:", sum(is.na(ct_check$family)), "\n")
+cat("NA in genus:", sum(is.na(ct_check$genus)), "\n")
+cat("NA in species_name:", sum(is.na(ct_check$species_name)), "\n")
+cat("NA in strip_label:", sum(is.na(ct_check$strip_label)), "\n")
+
+# Check category distribution
+cat("\nCT category distribution:\n")
+print(table(ct_check$ct_category, useNA = "ifany"))
+
+```
+
+# Step 10: Plotting
+```{r plot_raw_counts}
+
+latest_period <- "last 10 years"
+
+# Define the full set of abundance categories in a fixed order
+all_categories <- c(
+  "Connecticut common",
+  "Connecticut uncommon",
+  "Connecticut rare",
+  "New England",
+  "New England rare"
+)
+
+# Filter to only species with CT records OR significant NE presence
+ct_species <- by_bin |>
+  dplyr::filter(
+    period_label %in% latest_period,
+    ct_category %in% all_categories,
+    !is.na(family),
+    !is.na(genus)
+  ) |>
+  # Order by family, genus, species
+  dplyr::arrange(family, genus, species_name)
+
+# Check we have data
+if (nrow(ct_species) == 0) {
+  stop("No CT species found in data. Check your filters and data.")
+}
+
+# Get unique family-genus combinations in order
+family_genus_combos <- ct_species |>
+  dplyr::distinct(family, genus) |>
+  dplyr::arrange(family, genus)
+
+cat("Preparing to plot", nrow(family_genus_combos), "family-genus combinations\n")
+
+# Layout: 3 columns × 3 rows = 9 species per page
+ncol_facets     <- 3
+nrow_facets     <- 3
+panels_per_page <- ncol_facets * nrow_facets
+
+## 10a. Build a fixed legend grob (once)
+
+legend_df <- tibble::tibble(
+  ct_category = factor(all_categories, levels = all_categories),
+  x           = 1,
+  y           = 1
+)
+
+p_legend <- ggplot(legend_df, aes(x = x, y = y, fill = ct_category)) +
+  geom_point(shape = 22, size = 4) +
+  scale_fill_manual(
+    values = c(
+      "Connecticut common"   = "#238b45",
+      "Connecticut uncommon" = "#fd8d3c",
+      "Connecticut rare"     = "#d7301f",
+      "New England"          = "#3182bd",
+      "New England rare"     = "#9ecae1"
+    ),
+    labels = c(
+      "Connecticut common"   = "CT common (>50)",
+      "Connecticut uncommon" = "CT uncommon (11–50)",
+      "Connecticut rare"     = "CT rare (≤10)",
+      "New England"          = "NE only (>10)",
+      "New England rare"     = "NE rare (≤10)"
+    ),
+    limits = all_categories,
+    drop   = FALSE,
+    name   = ""
+  ) +
+  guides(
+    fill = guide_legend(
+      title        = "",
+      nrow         = 1,
+      override.aes = list(
+        shape = 22,
+        size  = 4,
+        color = NA
+      )
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position      = "top",
+    legend.justification = "center",
+    legend.direction     = "horizontal",
+    legend.margin        = margin(t = 3, r = 3, b = 3, l = 3),
+    legend.box.spacing   = unit(0.3, "lines")
+  )
+
+legend_grob <- cowplot::get_legend(p_legend)
+
+## 10b. Main PDF plotting loop
+
+pdf(
+  "phenology_CT_tracheophytes_complete.pdf",
+  width  = 11,
+  height = 8.5
+)
+
+# Iterate through each family-genus combination
+# (keep [1:10] while testing; remove to run all)
+for (i in seq_len(nrow(family_genus_combos))) {
+
+  fam <- family_genus_combos$family[i]
+  gen <- family_genus_combos$genus[i]
+
+  df_genus <- ct_species |>
+    dplyr::filter(family == fam, genus == gen)
+
+  if (nrow(df_genus) == 0) {
+    cat("Skipping", fam, "-", gen, "(no data)\n")
+    next
+  }
+
+  # Identify if species has any flowering observations
+  df_genus <- df_genus |>
+    dplyr::mutate(
+      strip_label   = droplevels(factor(strip_label)),
+      has_flowering = total_flowering_obs > 0
+    )
+
+  species_levels <- levels(df_genus$strip_label)
+  n_species      <- length(species_levels)
+
+  if (n_species == 0) {
+    cat("Skipping", fam, "-", gen, "(no valid species)\n")
+    next
+  }
+
+  n_pages <- ceiling(n_species / panels_per_page)
+
+  # Check if any species in this genus have flowering data
+  genus_has_flowering <- any(df_genus$has_flowering)
+
+  cat("Plotting", fam, "-", gen, ":", n_species, "species,", n_pages, "pages\n")
+
+  # Debug: guard against runaway pagination
+  if (n_pages > 100) {
+    cat("  WARNING: Too many pages (", n_pages, "), skipping genus\n")
+    next
+  }
+
+  for (page_idx in seq_len(n_pages)) {
+
+    tryCatch({
+
+      # Get data for this page: 9 species per page
+      start_idx <- (page_idx - 1L) * panels_per_page + 1L
+      end_idx   <- min(page_idx * panels_per_page, n_species)
+      species_this_page <- species_levels[start_idx:end_idx]
+
+      if (length(species_this_page) == 0) {
+        cat("  Skipping page", page_idx, "(no species)\n")
+        next
+      }
+
+      df_page <- df_genus |>
+        dplyr::filter(strip_label %in% species_this_page) |>
+        dplyr::mutate(strip_label = droplevels(factor(strip_label)))
+
+      if (nrow(df_page) == 0) {
+        cat("  Skipping page", page_idx, "(no data after filtering)\n")
+        next
+      }
+
+      # Verify we have valid strip_label levels
+      if (length(levels(df_page$strip_label)) == 0) {
+        cat("  Skipping page", page_idx, "(no valid strip_label levels)\n")
+        next
+      }
+
+      # Safety check for dimensions
+      n_species_page <- length(levels(df_page$strip_label))
+      if (n_species_page > panels_per_page || n_species_page == 0) {
+        cat("  WARNING: Invalid species count on page", page_idx, ":", n_species_page, "\n")
+        next
+      }
+
+      # Split data by sparse category AND flowering status for layered plotting
+      df_full         <- df_page |> dplyr::filter(sparse_category == "full_bars",  has_flowering)
+      df_light        <- df_page |> dplyr::filter(sparse_category == "light_bars", has_flowering)
+      df_points       <- df_page |> dplyr::filter(sparse_category == "points_only", has_flowering)
+      df_no_flowering <- df_page |> dplyr::filter(!has_flowering)
+      
+      # Main plot for this page (legend will be disabled here)
+      p <- ggplot(df_page, aes(x = week)) +
+        # Month guide lines
+        geom_vline(
+          data = month_boundaries,
+          aes(
+            xintercept = week_start,
+            linetype   = line_type,
+            alpha      = line_alpha
+          ),
+          inherit.aes = FALSE
+        ) +
+        scale_linetype_identity() +
+        scale_alpha_identity() +
+
+        # Layer 1: Full bars for well-sampled flowering species
+        { if (nrow(df_full) > 0) {
+            geom_col(
+              data = df_full,
+              aes(y = n_flowering, fill = ct_category),
+              alpha = 0.85
+            )
+          }
+        } +
+
+        # Layer 2: Light bars for moderately sampled flowering species
+        { if (nrow(df_light) > 0) {
+            geom_col(
+              data = df_light,
+              aes(y = n_flowering, fill = ct_category),
+              alpha = 0.4
+            )
+          }
+        } +
+
+        # Layer 3: Points for sparse flowering species
+        { if (nrow(df_points) > 0) {
+            list(
+              geom_point(
+                data = df_points |> dplyr::filter(n_flowering > 0),
+                aes(y = n_flowering, color = ct_category),
+                size  = 2.5,
+                alpha = 0.8
+              ),
+              # Small gray points for non-flowering observations of sparse species
+              geom_point(
+                data = df_points |> dplyr::filter(n_total > 0, n_flowering == 0),
+                aes(y = n_total),
+                color = "gray60",
+                size  = 1.5,
+                alpha = 0.5
+              )
+            )
+          }
+        } +
+
+        # Layer 4a: Total observation line for species WITH flowering data (gray)
+        { if (any(df_page$has_flowering)) {
+            geom_line(
+              data = df_page |> dplyr::filter(has_flowering),
+              aes(y = n_total),
+              color     = "#444444",
+              linewidth = 0.4
+            )
+          }
+        } +
+
+        # Layer 4b: Total observation line for species WITHOUT flowering data (colored by CT category)
+        { if (nrow(df_no_flowering) > 0) {
+            geom_line(
+              data = df_no_flowering,
+              aes(y = n_total, color = ct_category),
+              linewidth = 0.6
+            )
+          }
+        } +
+
+        # Scales
+        scale_x_continuous(
+          breaks = month_breaks$week_mid,
+          labels = month_breaks$month_label,
+          expand = c(0, 0)
+        ) +
+        scale_y_continuous(
+          limits = \(x) c(0, max(10, x[2])),
+          expand = expansion(mult = c(0, 0.05))
+        ) +
+        scale_fill_manual(
+          values = c(
+            "Connecticut common"   = "#238b45",
+            "Connecticut uncommon" = "#fd8d3c",
+            "Connecticut rare"     = "#d7301f",
+            "New England"          = "#3182bd",
+            "New England rare"     = "#9ecae1"
+          ),
+          limits = all_categories,
+          drop   = FALSE,
+          name   = ""
+        ) +
+        scale_color_manual(
+          values = c(
+            "Connecticut common"   = "#238b45",
+            "Connecticut uncommon" = "#fd8d3c",
+            "Connecticut rare"     = "#d7301f",
+            "New England"          = "#3182bd",
+            "New England rare"     = "#9ecae1"
+          ),
+          limits = all_categories,
+          drop   = FALSE,
+          guide  = "none"   # no color legend; we use fill legend only in the separate grob
+        ) +
+
+        # Faceting - always page 1 since we manually subset data
+        ggforce::facet_wrap_paginate(
+          ~ strip_label,
+          ncol    = ncol_facets,
+          nrow    = nrow_facets,
+          page    = 1,
+          scales  = "free_y",
+          labeller = labeller(strip_label = function(x) {
+
+  meta <- df_page |>
+    dplyr::filter(strip_label %in% x) |>
+    dplyr::distinct(strip_label, species_common, ct_native) |>
+    dplyr::arrange(strip_label)
+
+  sapply(x, function(sci_name_raw) {
+
+    # Remove any trailing " *" to avoid double stars
+    sci_name <- stringr::str_trim(
+      stringr::str_remove(sci_name_raw, "\\s*\\*$")
+    )
+
+    row <- meta[meta$strip_label == sci_name_raw, , drop = FALSE]
+
+    sci_fmt <- sci_name
+    if (nrow(row) == 1 && isTRUE(row$ct_native)) {
+      sci_fmt <- paste0(sci_fmt, " *")
+    }
+
+    common <- row$species_common
+    if (length(common) == 0 || is.na(common) || common == "") {
+      sci_fmt
+    } else {
+      paste0(sci_fmt, "\n(", common, ")")
+    }
+  })
+})
+
+        ) +
+
+        # Labels - Family and Genus at top
+        labs(
+          title = paste0(fam, " – ", gen),
+          subtitle = if (genus_has_flowering) {
+            paste0(
+              "Line: New England (NE) total observations per week over previous 10 years.\n",
+              "Bars/points: New England total flowering observations per week over previous 10 years\n",
+              "Opacity indicates data quality: solid bars (≥15 flowering obs in NE), light bars (5–14 obs in NE), points (<5 obs in NE).\n",
+              "Color indicates abundance: Green = CT common (>50 CT obs), Orange = CT uncommon (11–50 CT obs), ",
+              "Red = CT rare (≤10 CT obs), Blue = NE (no CT obs, >10 NE obs), Light blue = NE rare (no CT obs, ≤10 NE obs).\n",
+              "Colored abundance lines indicate non-flowering taxa. * = Native to Connecticut (CT). ",
+              "Page ", page_idx, " of ", n_pages
+            )
+          } else {
+            paste0(
+              "Line: New England (NE) total observations per week over previous 10 years.\n",
+              "No flowering data for this genus.\n",
+              "Color indicates abundance: Green = CT common (>50 CT obs), Orange = CT uncommon (11–50 CT obs), ",
+              "Red = CT rare (≤10 CT obs), Blue = NE (no CT obs, >10 NE obs), Light blue = NE rare (no CT obs, ≤10 NE obs).\n",
+              "* = Native to CT. Page ", page_idx, " of ", n_pages
+            )
+          },
+          x = NULL,
+          y = "Number of observations",
+        ) +
+
+        # Theme (no legend here)
+        theme_minimal(base_size = 10) +
+        theme(
+          axis.line.x        = element_blank(),
+          axis.ticks.x       = element_blank(),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          strip.background   = element_blank(),
+          strip.text         = element_text(
+            face       = "bold.italic",
+            size       = 7,
+            hjust      = 0.5,
+            lineheight = 1.1
+          ),
+          legend.position    = "none",
+          plot.title         = element_text(face = "bold", size = 12),
+          plot.subtitle      = element_text(size = 7, lineheight = 1.1),
+          plot.margin        = margin(t = 6, r = 8, b = 8, l = 8)
+        )
+
+      # Combine fixed legend and page plot into a single page
+# Create x-axis label grob (centered, adjusted for y-axis offset)
+x_label_grob <- grid::textGrob(
+  "Month (52 weeks/year)",
+  x = .7,  # Shifted right to account for y-axis label space
+  y = 0.5,
+  hjust = 0.5,
+  gp = grid::gpar(fontsize = 12)
+)
+
+# Create attribution text grob (right-aligned)
+attribution_grob <- grid::textGrob(
+  "Created by Jacob M. Musser | November 16, 2025",
+  x = 0.98,
+  y = 0.5,
+  hjust = 1,
+  gp = grid::gpar(fontsize = 7, col = "gray40")
+)
+
+# Combine x-axis label and attribution into bottom row
+bottom_row <- cowplot::plot_grid(
+  x_label_grob,
+  attribution_grob,
+  ncol = 2,
+  rel_widths = c(0.7, 0.3)
+)
+
+# Combine legend, plot, and bottom row into a single page
+combined <- cowplot::plot_grid(
+  legend_grob,
+  p,
+  bottom_row,
+  ncol        = 1,
+  rel_heights = c(0.08, 0.89, 0.03)
+)
+
+print(combined)
+
+    }, error = function(e) {
+      cat("  FATAL ERROR on page", page_idx, "for", fam, "-", gen, "\n")
+      cat("  Error message:", e$message, "\n")
+      if (exists("start_idx"))      cat("  start_idx:", start_idx, "end_idx:", end_idx, "\n")
+      if (exists("n_species_page")) cat("  n_species_page:", n_species_page, "\n")
+    })
+  }
+}
+
+dev.off()
+
+```
+
+# Step 11: Dataset overview and peak flowering summaries
+```{r summary_table}
+
+
+# Same 10-year cutoff you used conceptually before (adjust if latest_period is defined differently)
+cutoff_date <- as.Date(sprintf("%d-01-01", year(Sys.Date()) - 9))
+
+ct_obs_summary <- obs %>%
+  # 1) Time window: last ~10 years
+  filter(
+    !is.na(date),                  # <-- EDIT obs_date if needed
+    date >= cutoff_date
+  ) %>%
+  # 2) Restrict to Connecticut
+  # EDIT this filter to match your CT identifier:
+  #   e.g., state %in% c("Connecticut","CT") or region == "CT"
+  filter(
+    state_name == "Connecticut"                      # <-- EDIT THIS CONDITION
+  ) %>%
+  # 3) Species-level grouping that matches flowering_summary keys
+  group_by(
+    species_name
+  ) %>%
+  summarise(
+    ct_total_obs      = n(),                               # all CT obs
+    ct_flowering_obs  = sum(is_flowering == TRUE, na.rm = TRUE),  # CT obs that are flowering
+    .groups = "drop"
+  )
+
+
+
+earliest_flowering_NE <- obs %>%
+  # 1) Restrict to last ~10 years
+  filter(
+    # Replace 'obs_date' with your actual date column
+    !is.na(date),
+    date >= cutoff_date
+  ) %>%
+  # 2) Restrict to New England (edit this block to match your data)
+  # Examples:
+  # - If you have a 'region' column: region == "NE"
+  # - Or if you have state codes: state %in% c("CT","MA","RI","VT","NH","ME")
+  #filter(
+  #  region == "NE"    # <-- EDIT OR REPLACE THIS CONDITION
+  #) %>%
+  # 3) Restrict to flowering observations only
+  filter(
+    is_flowering == TRUE   # <-- EDIT this to your flowering flag column
+  ) %>%
+  # 4) Compute day-of-year from the observation date
+  mutate(doy = yday(date)) %>%
+  group_by(
+    species_name
+    # We do NOT need ct_category here; it will come from flowering_summary
+  ) %>%
+  # 5) Pick the record with the minimum day-of-year;
+  #    If multiple years tie, pick the earliest actual date
+  slice_min(doy, with_ties = TRUE) %>%
+  slice_min(date, with_ties = FALSE) %>%
+  summarise(
+    earliest_flowering_doy  = first(doy),
+    earliest_flowering_date = first(date),  # example real date (with year)
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Map doy into a reference year to get a clean month/day label
+    earliest_flowering_date_ref =
+      as.Date("2023-01-01") + (earliest_flowering_doy - 1),
+    earliest_flowering_month_day =
+      format(earliest_flowering_date_ref, "%b %d")
+  )
+
+
+
+# Helper: weighted quantile for week-of-year distribution
+wtd_quantile <- function(x, w, probs = 0.5) {
+  keep <- !is.na(x) & !is.na(w) & w > 0
+  x <- x[keep]
+  w <- w[keep]
+
+  if (!length(x) || sum(w) == 0) {
+    return(rep(NA_real_, length(probs)))
+  }
+
+  ord <- order(x)
+  x <- x[ord]
+  w <- w[ord]
+
+  cumw <- cumsum(w) / sum(w)
+
+  sapply(probs, function(p) {
+    idx <- which(cumw >= p)[1]
+    x[idx]
+  })
+}
+
+reference_year_start <- as.Date("2023-01-01")
+
+# Core week-binned phenology summary (from by_bin)
+flowering_summary_core <- by_bin %>%
+  filter(
+    period_label == latest_period,
+    ct_category %in% c(
+      "Connecticut common", "Connecticut uncommon", "Connecticut rare",
+      "New England", "New England rare"
+    )
+  ) %>%
+  group_by(
+    family, genus, species_name, species_common,
+    ct_native, ct_category
+  ) %>%
+  summarise(
+    total_flowering = sum(n_flowering, na.rm = TRUE),
+    total_obs       = sum(n_total,      na.rm = TRUE),
+
+    # Weighted-mean peak week
+    peak_week = if_else(
+      total_flowering > 0,
+      as.integer(round(weighted.mean(week, n_flowering, na.rm = TRUE))),
+      NA_integer_
+    ),
+
+    # Weeks with any flowering
+    flowering_weeks = sum(n_flowering > 0),
+
+    # Robust central (10–90%) flowering window in weeks
+    q10_week = if_else(
+      total_flowering > 0,
+      wtd_quantile(week, n_flowering, probs = 0.10),
+      NA_real_
+    ),
+    q90_week = if_else(
+      total_flowering > 0,
+      wtd_quantile(week, n_flowering, probs = 0.90),
+      NA_real_
+    ),
+    flowering_duration_weeks = if_else(
+      !is.na(q10_week) & !is.na(q90_week),
+      q90_week - q10_week,
+      NA_real_
+    ),
+
+    sparse_category = first(sparse_category),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Peak week → reference year month/day for readability
+    peak_date_ref  = if_else(
+      !is.na(peak_week),
+      reference_year_start + (peak_week - 1) * 7,
+      as.Date(NA)
+    ),
+    peak_month     = if_else(
+      !is.na(peak_date_ref),
+      month(peak_date_ref, label = TRUE),
+      NA_character_
+    ),
+    peak_month_day = if_else(
+      !is.na(peak_date_ref),
+      format(peak_date_ref, "%b %d"),
+      NA_character_
+    )
+  )
+
+# Join earliest NE flowering dates from obs
+flowering_summary <- flowering_summary_core %>%
+  left_join(
+    earliest_flowering_NE,
+    by = c("species_name")
+  ) %>%
+    # CT-specific observation counts (new)
+  left_join(
+    ct_obs_summary,
+    by = c("species_name")
+  ) %>%
+  arrange(family, genus, species_name)
+
+
+# Overview: species per family with CT-native breakdown
+family_overview <- flowering_summary |>
+  group_by(family) |>
+  summarise(
+    ct_native_spp = n_distinct(species_name[ct_native %in% TRUE]),
+    ct_common     = n_distinct(species_name[ct_category == "Connecticut common"]),
+    ct_uncommon   = n_distinct(species_name[ct_category == "Connecticut uncommon"]),
+    ct_rare       = n_distinct(species_name[ct_category == "Connecticut rare"]),
+    ne_only       = n_distinct(species_name[ct_category == "New England"]),
+    ne_rare       = n_distinct(species_name[ct_category == "New England rare"]),
+    total_spp     = n_distinct(species_name),
+    .groups = "drop"
+  ) |>
+  arrange(family)
+
+cat("=== DATASET OVERVIEW ===\n")
+cat("Total families:", nrow(family_overview), "\n")
+cat("Total genera:", n_distinct(flowering_summary$genus), "\n")
+cat("Total species:", nrow(flowering_summary), "\n")
+cat("Connecticut common (>50 obs):",
+    sum(flowering_summary$ct_category == "Connecticut common"), "\n")
+cat("Connecticut uncommon (11-50 obs):",
+    sum(flowering_summary$ct_category == "Connecticut uncommon"), "\n")
+cat("Connecticut rare (≤10 obs):",
+    sum(flowering_summary$ct_category == "Connecticut rare"), "\n")
+cat("New England (no CT obs, >10 NE obs):",
+    sum(flowering_summary$ct_category == "New England"), "\n")
+cat("New England rare (no CT obs, ≤10 NE obs):",
+    sum(flowering_summary$ct_category == "New England rare"), "\n")
+cat("Species with flowering data:",
+    sum(flowering_summary$total_flowering > 0), "\n")
+cat("Species without flowering data:",
+    sum(flowering_summary$total_flowering == 0), "\n")
+cat("Species known to be CT native:",
+    sum(!is.na(flowering_summary$ct_native) & flowering_summary$ct_native), "\n\n")
+
+family_overview |>
+  knitr::kable(
+    caption = "Species per family in Connecticut and New England",
+    col.names = c(
+      "Family", "CT native spp", "CT common", "CT uncommon",
+      "CT rare", "NE only", "NE rare", "Total spp"
+    )
+  )
+
+cat("\n\n=== PEAK FLOWERING EXAMPLES ===\n\n")
+
+# Show first 20 species as example
+flowering_summary |>
+  head(20) |>
+  select(
+    family, genus, species_name, species_common, ct_native, ct_category,
+    total_flowering, total_obs, peak_month, peak_week,
+    flowering_weeks, sparse_category
+  ) |>
+  knitr::kable(
+    caption = "First 20 species (ordered by family, genus, species)",
+    col.names = c(
+      "Family", "Genus", "Species", "Common name", "CT native", "Category",
+      "Flowering obs", "Total obs", "Peak month", "Peak week",
+      "Weeks flowering", "Data quality"
+    )
+  )
+
+```
+
+# Step 11B: Creating multi-page PDF for family overview table
+```{r family_table_pdf}
+# Pretty multi-page PDF table using gridExtra
+# install.packages("gridExtra")  # once, if needed
+
+
+
+pdf_file <- "family_overview_table.pdf"
+pdf(pdf_file, width = 8.5, height = 11)
+
+# Defensive: if no rows, write a one-page message and exit
+if (nrow(family_overview) == 0L) {
+  grid.newpage()
+  grid.text("No data to display (family_overview has 0 rows)",
+            x = 0.5, y = 0.5,
+            gp = gpar(fontsize = 14))
+  dev.off()
+  cat("\nFamily overview table saved to:", pdf_file, "(no rows)\n")
+} else {
+
+  # 1. Prepare data frame for the table
+
+  # Ensure the columns are in the intended order
+  df_tab <- family_overview[, c(
+    "family",
+    "ct_native_spp", "ct_common", "ct_uncommon",
+    "ct_rare", "ne_only", "ne_rare", "total_spp"
+  )]
+
+  # Replace NA with "" for nicer display
+  df_tab[] <- lapply(df_tab, function(x) {
+    x[is.na(x)] <- ""
+    x
+  })
+
+  # Give nice column labels directly on the data frame
+  colnames(df_tab) <- c(
+    "Family", "CT native spp", "CT common", "CT uncommon",
+    "CT rare", "NE only", "NE rare", "Total spp"
+  )
+
+  # 2. Pagination parameters
+  rows_per_page <- 35L  # adjust up/down to taste
+  n_rows        <- nrow(df_tab)
+  n_pages       <- ceiling(n_rows / rows_per_page)
+
+  # 3. Loop over pages and draw table
+  for (page_idx in seq_len(n_pages)) {
+    grid.newpage()
+
+    # Page title
+    grid.text(
+      "Species per Family in Connecticut and New England",
+      x  = 0.5, y = 0.97,
+      gp = gpar(fontsize = 16, fontface = "bold")
+    )
+    grid.text(
+      paste0("Page ", page_idx, " of ", n_pages),
+      x  = 0.5, y = 0.93,
+      gp = gpar(fontsize = 10)
+    )
+
+    # Subset rows for this page
+    idx_start <- (page_idx - 1L) * rows_per_page + 1L
+    idx_end   <- min(page_idx * rows_per_page, n_rows)
+    sub_df    <- df_tab[idx_start:idx_end, , drop = FALSE]
+
+    # Build a table grob with minimal but decent styling
+    tbl <- tableGrob(
+      sub_df,
+      rows = NULL,
+      theme = ttheme_minimal(
+        base_size = 8,
+        core = list(
+          fg_params = list(fontsize = 8)
+        ),
+        colhead = list(
+          fg_params = list(fontsize = 9, fontface = "bold")
+        )
+      )
+    )
+
+# Layout the table below the titles
+    pushViewport(viewport(x = 0.5, y = 0.45, width = 0.95, height = 0.80))
+    grid.draw(tbl)
+    popViewport()
+    
+    # Attribution at bottom
+    grid.text(
+      "Created by Jacob M. Musser | November 16, 2025",
+      x  = 0.98, y = 0.02,
+      just = "right",
+      gp = gpar(fontsize = 7, col = "gray40")
+    )
+  }
+
+  dev.off()
+  cat("\nFamily overview table saved to:", pdf_file, "\n")
+}
+
+
+```
+
+#Step 12: Rare CT Native Species
+```{r rare_ct_species}
+
+rare_ct <- flowering_summary |>
+  filter(ct_category == "Connecticut rare", total_flowering >= 3) |>
+  arrange(peak_month, family, genus, species_name)
+
+
+rare_ct <- flowering_summary |>
+  filter(ct_category == "Connecticut rare", ct_native == TRUE, total_flowering >= 3) |>
+  dplyr::mutate(
+    peak_month_desc = vapply(peak_week, peak_week_to_descriptor, character(1))
+  ) |>
+  dplyr::select(
+    peak_month_desc,          # new column
+    peak_month,               # keep your original if useful
+    family, genus, species_name, species_common,
+    peak_week, total_flowering, earliest_flowering_month_day, flowering_duration_weeks, ct_total_obs
+  )
+
+if (nrow(rare_ct) > 0) {
+  
+  ## Pretty PDF table for rare CT native species
+
+  pdf_file <- "rare_ct_native_species_flowering.pdf"
+  pdf(pdf_file, width = 11, height = 8.5)  # landscape
+
+  # Prepare the data frame for the table
+  rare_tab <- rare_ct |>
+    dplyr::select(
+      peak_month_desc,     # << the new readable flowering time
+      family, genus, species_name, species_common,
+      peak_week, total_flowering, earliest_flowering_month_day, flowering_duration_weeks, ct_total_obs
+    ) |>
+    dplyr::arrange(peak_week, family, genus, species_name)
+
+  # Replace NA with "" for display
+  rare_tab[] <- lapply(rare_tab, function(x) {
+    x[is.na(x)] <- ""
+    x
+  })
+
+  # Nice column labels
+  colnames(rare_tab) <- c(
+    "Peak month", "Family", "Genus", "Species", "Common name",
+    "Peak week", "NE Flowering \nObs.", "Earliest \nFlower Date", "Weeks flowering", "CT Obs."
+  )
+
+  # Pagination parameters
+  rows_per_page <- 25L  # fewer rows since we’re in landscape; adjust as needed
+  n_rows        <- nrow(rare_tab)
+  n_pages       <- ceiling(n_rows / rows_per_page)
+
+  for (page_idx in seq_len(n_pages)) {
+    grid.newpage()
+
+    # Titles
+    grid.text(
+      "Connecticut Rare Native Species: Peak Flowering Times",
+      x  = 0.5, y = 0.95,
+      gp = gpar(fontsize = 16, fontface = "bold")
+    )
+    grid.text(
+      paste0(
+        "(", nrow(rare_tab),
+        " species with \u22653 flowering observations, organized by peak month)"
+      ),
+      x  = 0.5, y = 0.90,
+      gp = gpar(fontsize = 10)
+    )
+    grid.text(
+      paste0("Page ", page_idx, " of ", n_pages),
+      x  = 0.5, y = 0.86,
+      gp = gpar(fontsize = 9)
+    )
+
+    # Subset rows for this page
+    idx_start <- (page_idx - 1L) * rows_per_page + 1L
+    idx_end   <- min(page_idx * rows_per_page, n_rows)
+    sub_df    <- rare_tab[idx_start:idx_end, , drop = FALSE]
+
+    # Table grob with minimal styling
+    tbl <- tableGrob(
+      sub_df,
+      rows  = NULL,
+      theme = ttheme_minimal(
+        base_size = 8,
+        core = list(
+          fg_params = list(fontsize = 8)
+        ),
+        colhead = list(
+          fg_params = list(fontsize = 9, fontface = "bold")
+        )
+      )
+    )
+
+# Layout the table below the titles
+    pushViewport(viewport(x = 0.5, y = 0.43, width = 0.96, height = 0.75))
+    grid.draw(tbl)
+    popViewport()
+    
+    # Attribution at bottom
+    grid.text(
+      "Created by Jacob M. Musser | November 16, 2025",
+      x  = 0.98, y = 0.02,
+      just = "right",
+      gp = gpar(fontsize = 7, col = "gray40")
+    )
+  }
+
+  dev.off()
+  cat("\nRare native species table saved to:", pdf_file, "\n")
+
+} else {
+  cat("No rare native species table created (insufficient data or missing native status).\n")
+}
+
+
+
+```
+
+#Step 12B: Create PDF for rare native species table
+```{r rare_native_table_pdf}
+I
+```
+
+# Step 13: Ridge Plots by Peak Flowering Time - Setup
+
+This section creates multi-page PDFs with ridge plots showing flowering phenology for CT native species, organized by peak flowering time.
+
+```{r ridgeplot_setup}
+
+
+# Prepare data for ridge plots: CT native species with flowering data
+# Use the flowering_summary created in Step 11
+ct_native_flowering <- flowering_summary |>
+  filter(
+    !is.na(ct_native),
+    ct_native == TRUE,
+    total_flowering >= 3,  # Minimum threshold for meaningful visualization
+    !is.na(peak_week)      # Must have a peak week
+  ) |>
+  arrange(peak_week, family, genus, species_name)
+
+cat("\n=== RIDGE PLOT DATA SUMMARY ===\n\n")
+cat("CT native species with ≥3 flowering observations:", nrow(ct_native_flowering), "\n")
+cat("Peak flowering range: Week", min(ct_native_flowering$peak_week, na.rm = TRUE),
+    "to Week", max(ct_native_flowering$peak_week, na.rm = TRUE), "\n\n")
+
+# Show first few species as example
+ct_native_flowering |>
+  head(10) |>
+  select(peak_week, peak_month, family, species_name, total_flowering) |>
+  knitr::kable(
+    caption = "First 10 CT native species (ordered by peak flowering week)",
+    col.names = c("Peak week", "Peak month", "Family", "Species", "Flowering obs")
+  )
+
+```
+
+# Step 14: Prepare Weekly Data for Ridge Plots
+
+```{r prepare_ridge_data}
+
+# Get weekly flowering data for CT native species
+# Use by_bin which contains the weekly data
+ridge_data <- by_bin |>
+  filter(
+    species_name %in% ct_native_flowering$species_name,
+    n_flowering > 0,
+    period_label == latest_period
+  ) |>
+  # Join with flowering_summary to get peak_week for ordering
+  left_join(
+    ct_native_flowering |> select(species_name, peak_week),
+    by = "species_name"
+  ) |>
+  # Create display label
+  mutate(
+    species_label = if_else(
+      !is.na(species_common) & species_common != "",
+      paste0(species_name, " (", family, ")\n", species_common),
+      paste0(species_name, " (", family, ")")
+    )
+  )
+
+# Order species by peak week
+species_order <- ct_native_flowering |>
+  arrange(peak_week, family, species_name) |>
+  mutate(
+    species_label = if_else(
+      !is.na(species_common) & species_common != "",
+      paste0(species_name, " (", family, ")\n", species_common),
+      paste0(species_name, " (", family, ")")
+    )
+  ) |>
+  pull(species_label)
+
+ridge_data <- ridge_data |>
+  mutate(
+    species_label = factor(species_label, levels = species_order)
+  )
+
+cat("\nRidge plot data prepared.\n")
+cat("Species in dataset:", length(unique(ridge_data$species_name)), "\n")
+cat("Total flowering observations:", sum(ridge_data$n_flowering), "\n")
+
+```
+
+# Step 15: Create Multi-Page Ridge Plot PDF
+
+```{r create_ridge_pdf}
+
+# Configuration for PDF layout
+species_per_page <- 25  # Adjust this to fit more/fewer species per page
+pdf_filename <- "ct_native_flowering_ridgeplots.pdf"
+
+# Get ordered species list
+ordered_species <- levels(ridge_data$species_label)
+n_species <- length(ordered_species)
+n_pages <- ceiling(n_species / species_per_page)
+
+cat("\n=== CREATING RIDGE PLOT PDF ===\n\n")
+cat("Total species:", n_species, "\n")
+cat("Species per page:", species_per_page, "\n")
+cat("Total pages:", n_pages, "\n")
+cat("Output file:", pdf_filename, "\n\n")
+
+# Create PDF
+pdf(pdf_filename, width = 8.5, height = 11)  # Portrait orientation
+
+for (page_num in 1:n_pages) {
+  # Determine species for this page
+  start_idx <- (page_num - 1) * species_per_page + 1
+  end_idx <- min(page_num * species_per_page, n_species)
+  page_species <- ordered_species[start_idx:end_idx]
+  
+  # Filter data for this page
+  page_data <- ridge_data |>
+    filter(species_label %in% page_species) |>
+    # Reverse factor levels for this page so earliest is at top
+    mutate(species_label = factor(species_label, levels = rev(levels(droplevels(species_label))))) |>
+    # Expand observations to individual weeks (for ridge density)
+    uncount(n_flowering)
+  
+  # Create ridge plot
+  p <- ggplot(page_data, aes(x = week, y = species_label, fill = stat(x))) +
+    geom_density_ridges_gradient(
+      scale = 2,
+      rel_min_height = 0.01,
+      bandwidth = 1.5,
+      alpha = 0.8
+    ) +
+    scale_fill_viridis_c(
+      name = "Week",
+      option = "viridis",
+      limits = c(1, 52),  # Fixed range for consistent colors across all pages
+      direction = -1,
+      guide = "none"
+    ) +
+    scale_x_continuous(
+      breaks = c(1, 5, 9, 13, 18, 22, 27, 31, 35, 40, 44, 48),  # Approximate start of each month
+      labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+      limits = c(1, 52),
+      expand = c(0.01, 0)
+    ) +
+    labs(
+      title = paste0("CT Native Species Flowering Phenology (Page ", page_num, " of ", n_pages, ")"),
+      subtitle = "Ordered by peak flowering time | Data from iNaturalist observations across New England",
+      x = "Month",
+      y = NULL,
+      caption = "Created by Jacob M. Musser | November 16, 2025"
+    ) +
+    theme_minimal(base_size = 9) +
+    theme(
+      axis.text.y = element_text(size = 7, hjust = 1, lineheight = 0.9),
+      axis.text.x = element_text(size = 8),
+      axis.title.x = element_text(size = 9, margin = margin(t = 10)),
+      plot.title = element_text(size = 12, face = "bold", margin = margin(b = 5)),
+      plot.subtitle = element_text(size = 9, margin = margin(b = 10)),
+      plot.caption = element_text(size = 7, hjust = 1, margin = margin(t = 5)), 
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(color = "gray90", linewidth = 0.3),
+      plot.margin = margin(10, 10, 10, 10)
+    )
+  
+  print(p)
+  
+  cat("Completed page", page_num, "of", n_pages, "\n")
+}
+
+dev.off()
+
+cat("\nRidge plot PDF saved to:", pdf_filename, "\n")
+cat("\nSUCCESS: All", n_pages, "pages generated.\n")
+
+```
+
+# Step 16: Summary of Ridge Plot Output
+
+```{r ridge_summary}
+
+cat("\n=== RIDGE PLOT SUMMARY ===\n\n")
+cat("PDF file:", pdf_filename, "\n")
+cat("Total pages:", n_pages, "\n")
+cat("Species plotted:", n_species, "\n")
+cat("Species per page:", species_per_page, "\n\n")
+
+# Show distribution of species across months
+peak_distribution <- ct_native_flowering |>
+  count(peak_month) |>
+  arrange(peak_month)
+
+cat("Distribution of peak flowering by month:\n")
+print(peak_distribution)
+
+```
+
+```{r session_info}
+sessionInfo()
+```
